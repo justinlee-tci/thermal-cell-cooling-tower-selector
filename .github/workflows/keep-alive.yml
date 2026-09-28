@@ -1,35 +1,43 @@
 name: Keep Alive Ping
 
+# Supabase pauses a free-tier project after ~7 days of inactivity.
+#
+# Two things were wrong with the previous version:
+#
+#  1. A 33%-per-day random gate decided whether to ping. That averages 3 days,
+#     but the average was never what mattered -- the worst case was. The real
+#     keep_alive table shows it hitting 7-day gaps twice, right at the pause
+#     threshold. The cron now sets the interval directly.
+#
+#  2. It used `curl` without --fail, which exits 0 even on a 401 or 500. Pings
+#     stopped landing after 2026-08-17 and the job kept reporting green for six
+#     weeks. The script now exits non-zero, so a failure shows red here.
+#
+# '*/3' fires on days 1,4,7,...,28,31, so the gap is never more than 3 days
+# (month-end rollover only ever shortens it), leaving 4 days of margin.
 on:
   schedule:
-    - cron: '0 12 * * *'  # Daily at 12:00 UTC
-  workflow_dispatch: # Allows manual trigger
+    - cron: '0 12 */3 * *'   # 12:00 UTC, every 3rd day of the month
+  workflow_dispatch:          # manual run from the Actions tab
 
 jobs:
   keep-alive:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Random interval check (1-4 days)
-        id: random_check
-        run: |
-          # Generate random number 1-100 to determine if we should run
-          # This gives roughly 33% chance per day, resulting in average 1-4 day intervals
-          RANDOM_NUM=$((RANDOM % 100 + 1))
-          
-          # 33% chance to run = roughly every 3 days on average (1-4 day range)
-          if [ $RANDOM_NUM -le 33 ]; then
-            echo "should_run=true" >> $GITHUB_OUTPUT
-            echo "Random check passed: Running keep-alive (random=$RANDOM_NUM)"
-          else
-            echo "should_run=false" >> $GITHUB_OUTPUT
-            echo "Random check failed: Skipping keep-alive (random=$RANDOM_NUM)"
-          fi
-      
-      - name: Trigger keep-alive endpoint
-        if: steps.random_check.outputs.should_run == 'true'
-        run: |
-          curl -X POST \
-            -H "Authorization: Bearer ${{ secrets.KEEP_ALIVE_SECRET }}" \
-            -H "Content-Type: application/json" \
-            "${{ secrets.KEEP_ALIVE_URL }}/api/keep-alive"
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # No `npm install` on purpose: the script uses only Node built-ins and
+      # global fetch, so there is no dependency step that can fail.
+      - name: Ping the database
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/keep-alive.mjs
+
+# NOTE: GitHub disables scheduled workflows after 60 days of repository
+# inactivity. If the repo goes quiet that long, re-enable this from the
+# Actions tab -- no change to this file will prevent it.
