@@ -1,24 +1,36 @@
 name: Keep Alive Ping
 
-# Supabase pauses a free-tier project after ~7 days of inactivity.
+# Keeps two separate clocks from expiring:
 #
-# Two things were wrong with the previous version:
+#  1. Supabase pauses a free-tier project after ~7 days of inactivity.
+#     The ping step writes a row into `keep_alive` every 3 days.
 #
-#  1. A 33%-per-day random gate decided whether to ping. That averages 3 days,
-#     but the average was never what mattered -- the worst case was. The real
-#     keep_alive table shows it hitting 7-day gaps twice, right at the pause
-#     threshold. The cron now sets the interval directly.
+#  2. GitHub disables a scheduled workflow after 60 days of *repository*
+#     inactivity -- and resuming commits does NOT re-enable it. That is what
+#     actually killed this workflow: the last commit before a 61-day gap was
+#     2026-06-18, GitHub disabled the schedule on 2026-08-17, and the final
+#     ping landed that same day. The "keep the repo awake" step below commits
+#     a timestamp whenever the newest commit is getting old, so the 60-day
+#     clock is reset long before it can expire.
 #
-#  2. It used `curl` without --fail, which exits 0 even on a 401 or 500. Pings
-#     stopped landing after 2026-08-17 and the job kept reporting green for six
-#     weeks. The script now exits non-zero, so a failure shows red here.
-#
-# '*/3' fires on days 1,4,7,...,28,31, so the gap is never more than 3 days
-# (month-end rollover only ever shortens it), leaving 4 days of margin.
+# History that made this necessary (gaps between commits):
+#     2025-08-14 -> 2025-12-22 = 130 days
+#     2025-12-22 -> 2026-03-24 =  92 days
+#     2026-06-18 -> 2026-08-19 =  61 days
 on:
   schedule:
     - cron: '0 12 */3 * *'   # 12:00 UTC, every 3rd day of the month
   workflow_dispatch:          # manual run from the Actions tab
+
+# Needed so the job can push the timestamp commit back to the repo.
+permissions:
+  contents: write
+
+env:
+  # Commit a timestamp once the newest commit reaches this age. Well clear of
+  # GitHub's 60-day threshold, while staying quiet during active development:
+  # zero commits while you are working, roughly 8 a year while the repo sleeps.
+  REPO_ACTIVITY_MAX_AGE_DAYS: 45
 
 jobs:
   keep-alive:
@@ -38,6 +50,22 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: node scripts/keep-alive.mjs
 
-# NOTE: GitHub disables scheduled workflows after 60 days of repository
-# inactivity. If the repo goes quiet that long, re-enable this from the
-# Actions tab -- no change to this file will prevent it.
+      - name: Keep the repo awake
+        run: |
+          set -euo pipefail
+          LAST_COMMIT_TS=$(git log -1 --format=%ct)
+          AGE_DAYS=$(( ( $(date +%s) - LAST_COMMIT_TS ) / 86400 ))
+          echo "Newest commit is ${AGE_DAYS} day(s) old (threshold: ${REPO_ACTIVITY_MAX_AGE_DAYS})."
+
+          if [ "$AGE_DAYS" -lt "$REPO_ACTIVITY_MAX_AGE_DAYS" ]; then
+            echo "Repo is active enough - nothing to commit."
+            exit 0
+          fi
+
+          echo "Committing a timestamp to reset GitHub's 60-day inactivity clock."
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/last-keep-alive.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/last-keep-alive.txt
+          git commit -m "chore: keep-alive heartbeat (resets the 60-day workflow clock) [skip ci]"
+          git push
